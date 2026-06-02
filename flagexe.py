@@ -7,7 +7,6 @@ from PIL import Image
 import winreg as reg
 import threading
 import ctypes
-from ctypes import wintypes
 
 # ------------------------------------------------------------------
 def resource_path(relative_path):
@@ -19,7 +18,9 @@ def resource_path(relative_path):
 
 FLAGS_DIR = resource_path("flags")
 UPDATE_INTERVAL = 60
-force_refresh = False
+
+stop_event = threading.Event()
+refresh_event = threading.Event()
 
 # ------------------------------------------------------------------
 def get_country():
@@ -29,71 +30,78 @@ def get_country():
         data = resp.json()
         code = (data.get("countryCode", "") or "").lower()
         name = data.get("countryName", "Unknown")
-        return {"country_code": code, "country_name": name}
-    except:
-        return {"country_code": "", "country_name": "Unknown"}
+        return code, name
+    except Exception:
+        return "", "Unknown"
 
 def load_flag(code: str) -> Image.Image:
-    try:
-        if not code:
-            raise FileNotFoundError
+    if code:
         for ext in (".png", ".ico"):
             path = os.path.join(FLAGS_DIR, code + ext)
             if os.path.exists(path):
-                img = Image.open(path).resize((32, 32), Image.Resampling.LANCZOS)
-                return img
-        raise FileNotFoundError
-    except:
-        return Image.new("RGB", (32, 32), (255, 0, 0))
+                return Image.open(path).resize((32, 32), Image.Resampling.LANCZOS)
+    return Image.new("RGB", (32, 32), (255, 0, 0))
 
 # ------------------------------------------------------------------
 def updater(icon: pystray.Icon):
     last_code = None
     last_update = 0
-    global force_refresh
 
-    while True:
+    while not stop_event.is_set():
         now = time.time()
-        if force_refresh or now - last_update >= UPDATE_INTERVAL:
-            force_refresh = False
-            info = get_country()
-            code = info["country_code"]
-            name = info["country_name"]
+        if refresh_event.is_set() or now - last_update >= UPDATE_INTERVAL:
+            refresh_event.clear()
+            code, name = get_country()
 
             icon.title = f"{name} ({code.upper()})" if code else name
             if code != last_code:
                 icon.icon = load_flag(code)
+                if last_code is not None and code:
+                    icon.notify(f"{name} ({code.upper()})", "CountryFlags")
                 last_code = code
             last_update = now
-        time.sleep(1)
+
+        stop_event.wait(1)
 
 def on_refresh(icon, item):
-    global force_refresh
-    force_refresh = True
+    refresh_event.set()
 
 def on_exit(icon, item):
+    stop_event.set()
     icon.stop()
-    # Принудительно убиваем ВЕСЬ процесс Windows-стилем
-    ctypes.windll.kernel32.ExitProcess(0)
 
 # ------------------------------------------------------------------
-def add_to_startup():
+def sync_startup():
     try:
-        key = reg.HKEY_CURRENT_USER
         key_path = r"Software\Microsoft\Windows\CurrentVersion\Run"
-        exe_path = sys.executable
-
-        with reg.OpenKey(key, key_path, 0, reg.KEY_ALL_ACCESS) as rk:
+        exe_path = f'"{sys.executable}"'
+        with reg.OpenKey(reg.HKEY_CURRENT_USER, key_path, 0, reg.KEY_ALL_ACCESS) as rk:
+            # Удаляем старое имя ключа если осталось
             try:
-                reg.QueryValueEx(rk, "CountryFlagsTray")
-                return
+                reg.DeleteValue(rk, "CountryFlagsTray")
             except FileNotFoundError:
-                reg.SetValueEx(rk, "CountryFlagsTray", 0, reg.REG_SZ, exe_path)
-    except:
+                pass
+            # Создаём или обновляем (если путь изменился — при переносе папки)
+            try:
+                current, _ = reg.QueryValueEx(rk, "CountryFlags")
+                if current != exe_path:
+                    reg.SetValueEx(rk, "CountryFlags", 0, reg.REG_SZ, exe_path)
+            except FileNotFoundError:
+                reg.SetValueEx(rk, "CountryFlags", 0, reg.REG_SZ, exe_path)
+    except Exception:
         pass
+
+def ensure_single_instance():
+    mutex = ctypes.windll.kernel32.CreateMutexW(None, False, "CountryFlagsTrayMutex")
+    if ctypes.windll.kernel32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
+        sys.exit(0)
+    return mutex  # держим ссылку, чтобы мьютекс жил
 
 # ------------------------------------------------------------------
 def main():
+    _mutex = ensure_single_instance()
+    sync_startup()
+
     img = Image.new("RGB", (32, 32), (50, 50, 50))
     menu = pystray.Menu(
         pystray.MenuItem("Обновить сейчас", on_refresh),
@@ -101,14 +109,9 @@ def main():
     )
     icon = pystray.Icon("CountryFlags", icon=img, title="IP Flag", menu=menu)
 
-    # Запускаем иконку в отдельном НЕ-демоническом потоке
-    threading.Thread(target=icon.run, daemon=False).start()
-
-    # Основной цикл — updater
-    updater(icon)
+    threading.Thread(target=updater, args=(icon,), daemon=True).start()
+    icon.run()
 
 # ------------------------------------------------------------------
-add_to_startup()
-
 if __name__ == "__main__":
     main()
